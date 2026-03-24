@@ -1,0 +1,1 @@
+import{d as n}from"./main-BT3WFMLW.js";var u=function(r){return typeof r=="function"},o=function(r){return typeof r=="number"};function s(r){var t=n.useRef(r);return t.current=r,t}export{o as a,u as i,s as u};

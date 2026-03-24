@@ -1,0 +1,7 @@
+interface:
+  display_name: "Admin API CLI Builder"
+  short_description: "Build env-driven admin token batch CLI tools."
+  default_prompt: "Use $admin-api-cli-builder to build a small admin-login CLI from my curl snippets or HAR flow."
+
+policy:
+  allow_implicit_invocation: true
