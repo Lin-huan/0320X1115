@@ -130,6 +130,31 @@ def normalize_base_url(base_url: str) -> str:
     return base_url.rstrip("/")
 
 
+def infer_dc_base_url(base_url: str) -> str:
+    parsed = urllib.parse.urlparse(normalize_base_url(base_url))
+    hostname = parsed.hostname or ""
+    if not hostname or hostname.startswith("dc."):
+        return normalize_base_url(base_url)
+
+    dc_hostname = f"dc.{hostname}"
+    netloc = dc_hostname
+    if parsed.port:
+        netloc = f"{dc_hostname}:{parsed.port}"
+    return urllib.parse.urlunparse((parsed.scheme, netloc, "", "", "", "")).rstrip("/")
+
+
+def unique_urls(urls: list[str]) -> list[str]:
+    seen: set[str] = set()
+    results: list[str] = []
+    for item in urls:
+        normalized = normalize_base_url(item)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        results.append(normalized)
+    return results
+
+
 def normalize_api_prefix(prefix: str) -> str:
     prefix = prefix.strip()
     if not prefix:
@@ -417,17 +442,68 @@ class OnesInviteClient:
         timeout: float = 30.0,
     ) -> None:
         self.base_url = normalize_base_url(base_url)
-        self.identity_base_url = normalize_base_url(identity_base_url or base_url)
-        self.project_base_url = normalize_base_url(project_base_url or base_url)
+        self.identity_base_urls = unique_urls(
+            [identity_base_url] if identity_base_url else [base_url, infer_dc_base_url(base_url)]
+        )
+        self.project_base_urls = unique_urls(
+            [project_base_url] if project_base_url else [base_url, infer_dc_base_url(base_url)]
+        )
+        self.identity_base_url = self.identity_base_urls[0]
+        self.project_base_url = self.project_base_urls[0]
         self.org_uuid = org_uuid
         self.team_uuid = team_uuid
         self.region_uuid = region_uuid
         self.project_app_path = normalize_api_prefix(project_app_path) or DEFAULT_PROJECT_APP_PATH
         self.project_api_prefix = normalize_api_prefix(project_api_prefix) or DEFAULT_PROJECT_API_PREFIX
         self.login_encryption_source = login_encryption_source
-        self.identity_http = HttpClient(self.identity_base_url, timeout=timeout)
-        self.project_http = HttpClient(self.project_base_url, timeout=timeout)
+        self.timeout = timeout
+        self._http_clients: dict[str, HttpClient] = {}
+        self.identity_http = self._http_client_for(self.identity_base_url)
+        self.project_http = self._http_client_for(self.project_base_url)
         self.access_token = ""
+
+    def _http_client_for(self, base_url: str) -> HttpClient:
+        normalized = normalize_base_url(base_url)
+        client = self._http_clients.get(normalized)
+        if client is None:
+            client = HttpClient(normalized, timeout=self.timeout)
+            self._http_clients[normalized] = client
+        return client
+
+    def _request_json_with_fallback(
+        self,
+        base_urls: list[str],
+        method: str,
+        path: str,
+        *,
+        headers: dict[str, str] | None = None,
+        payload: Any | None = None,
+        expected_status: set[int] | None = None,
+        follow_redirects: bool = True,
+    ) -> Any:
+        errors: list[str] = []
+        for index, candidate in enumerate(base_urls):
+            client = self._http_client_for(candidate)
+            try:
+                response = client.request_json(
+                    method,
+                    path,
+                    headers=headers,
+                    payload=payload,
+                    expected_status=expected_status,
+                    follow_redirects=follow_redirects,
+                )
+                self.project_http = client
+                self.project_base_url = candidate
+                return response
+            except ApiError as error:
+                message = str(error)
+                is_last = index == len(base_urls) - 1
+                if "HTTP 404" not in message or is_last:
+                    raise
+                errors.append(message)
+
+        raise ApiError(" | ".join(errors))
 
     def _auth_headers(self) -> dict[str, str]:
         headers = {
@@ -452,10 +528,11 @@ class OnesInviteClient:
         )
 
     def fetch_login_support(self) -> dict[str, Any]:
-        return self.project_http.request_json(
+        return self._request_json_with_fallback(
+            self.project_base_urls,
             "GET",
             join_url_path(self.project_api_prefix, "/auth/login_support")
-            + f"?org_uuid={urllib.parse.quote(self.org_uuid)}&team_uuid=",
+            + f"?org_uuid={urllib.parse.quote(self.org_uuid)}",
             headers={
                 "Accept-Language": DEFAULT_LANGUAGE,
                 "Referer": f"{self.base_url}/auth/login?lang={DEFAULT_LANGUAGE}&org_uuid={self.org_uuid}",
@@ -576,8 +653,8 @@ class OnesInviteClient:
             raise ApiError("oauth/token 未返回 access_token。")
 
         self.access_token = access_token
-        self.identity_http._set_cookie("ones-lt", access_token)
-        self.project_http._set_cookie("ones-lt", access_token)
+        for client in self._http_clients.values():
+            client._set_cookie("ones-lt", access_token)
         return LoginContext(
             access_token=access_token,
             org_uuid=org_user["org_uuid"],
@@ -607,7 +684,8 @@ class OnesInviteClient:
         }
 
     def invite_members(self, emails: list[str]) -> Any:
-        return self.project_http.request_json(
+        return self._request_json_with_fallback(
+            self.project_base_urls,
             "POST",
             join_url_path(self.project_api_prefix, f"/team/{self.team_uuid}/invitations/add_batch"),
             headers=self._auth_headers(),
@@ -619,7 +697,8 @@ class OnesInviteClient:
         )
 
     def fetch_invitation_payload(self) -> Any:
-        return self.project_http.request_json(
+        return self._request_json_with_fallback(
+            self.project_base_urls,
             "GET",
             join_url_path(self.project_api_prefix, f"/team/{self.team_uuid}/invitations"),
             headers=self._auth_headers(),
@@ -651,14 +730,17 @@ class OnesInviteClient:
         return ordered_records
 
     def activate_member(self, email: str, invite_code: str, member_password: str) -> Any:
-        public_http = HttpClient(self.project_base_url, timeout=self.project_http.timeout)
-        return public_http.request_json(
+        return self._request_json_with_fallback(
+            self.project_base_urls,
             "POST",
             join_url_path(self.project_api_prefix, "/auth/invite_join_team"),
             headers={
                 "Accept-Language": DEFAULT_LANGUAGE,
-                "Origin": self.base_url,
-                "Referer": f"{self.base_url}{self.project_app_path}/?org_uuid={self.org_uuid}&region_uuid={self.region_uuid}",
+                "Origin": self.project_base_url,
+                "Referer": (
+                    f"{self.project_base_url}{self.project_app_path}/"
+                    f"?org_uuid={self.org_uuid}&region_uuid={self.region_uuid}"
+                ),
             },
             payload={
                 "email": email,
